@@ -1,8 +1,12 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
+#     "lime==0.2.0.1",
 #     "marimo>=0.19.7",
+#     "matplotlib==3.10.8",
+#     "numpy==2.2.6",
 #     "pillow==12.1.0",
+#     "scikit-image==0.25.2",
 #     "torch==2.10.0",
 #     "torchvision==0.25.0",
 # ]
@@ -93,14 +97,22 @@ def _(mo):
     return
 
 
-@app.cell(column=1)
+@app.cell(column=1, hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Prepare the data
+    """)
+    return
+
+
+@app.cell
 def _():
     import marimo as mo
     from PIL import Image
     import torch
     from torchvision import models, transforms
     import torch.nn.functional as F
-    return F, Image, mo, models, transforms
+    return F, Image, mo, models, torch, transforms
 
 
 @app.cell
@@ -109,7 +121,7 @@ def _(Image):
     import random
     import os
 
-    random.seed(42)
+    random.seed(1337)
 
     image_paths = random.sample(glob.glob('images/*.JPEG'), 10)
 
@@ -125,21 +137,30 @@ def _(Image):
 
 @app.cell
 def _(images, transforms):
-    def transform_image(img):
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                        std=[0.229, 0.224, 0.225])       
+    def resize_image(img):
         transf = transforms.Compose([
             transforms.Resize((256, 256)),
             transforms.CenterCrop(224),
+        ])    
+
+        return transf(img)
+
+    def process_image(img):
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                        std=[0.229, 0.224, 0.225])       
+        transf = transforms.Compose([
             transforms.ToTensor(),
             normalize
         ])    
 
-        return transf(img).unsqueeze(0)
+        return transf(img)
 
-    trans_images = [transform_image(img) for img in images]
+
+    transform_image = lambda img: process_image(resize_image(img))
+
+    trans_images = [transform_image(img).unsqueeze(0) for img in images]
     trans_images
-    return (trans_images,)
+    return process_image, resize_image, trans_images
 
 
 @app.cell
@@ -158,8 +179,16 @@ def _(os):
 
 
 @app.cell(column=2)
+def _(mo):
+    mo.md(r"""
+    ## Model and predictions
+    """)
+    return
+
+
+@app.cell
 def _(models):
-    model = models.inception_v3(pretrained=True)
+    model = models.resnet18(pretrained=True)
     return (model,)
 
 
@@ -179,10 +208,67 @@ def _(F, logits):
 
 
 @app.cell
-def _(idx2label, images, mo, probs):
+def _(idx2label, probs):
+    prob_label = [[(p, idx2label[idx]) for p, idx in zip(classes[0][0].detach().numpy(), classes[1][0].detach().numpy())] for classes in probs]
+    prob_label
+    return (prob_label,)
+
+
+@app.cell
+def _(images, mo, prob_label):
     mo.vstack(
-        [mo.hstack([img, "\n".join([idx2label[label] for label in classes])]) for img, classes in zip(images, probs)]
+        [mo.hstack([img, mo.ui.table(data=[{'proba': f"{elem[0]:.4f}", 'label': elem[1]} for elem in classes])], widths=[2, 1]) for img, classes in zip(images, prob_label)]
     )
+    return
+
+
+@app.cell(column=3)
+def _(F, model, process_image, torch):
+    def batch_predict(images):
+        model.eval()
+        batch = torch.stack(tuple([process_image(img) for img in images]), dim=0)
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
+        batch = batch.to(device)
+
+        logits = model(batch)
+        probs = F.softmax(logits, dim=1)
+        return probs.detach().cpu().numpy()
+    return (batch_predict,)
+
+
+@app.cell
+def _():
+    from lime import lime_image
+    import numpy as np
+    return lime_image, np
+
+
+@app.cell
+def _(batch_predict, images, lime_image, np, resize_image):
+    explainer = lime_image.LimeImageExplainer()
+    explanation = explainer.explain_instance(np.array(resize_image(images[0])), 
+                                             batch_predict,
+                                             top_labels=5, 
+                                             hide_color=0, 
+                                             num_samples=1000)
+    return (explanation,)
+
+
+@app.cell
+def _():
+    from skimage.segmentation import mark_boundaries
+    import matplotlib.pyplot as plt
+    return (mark_boundaries,)
+
+
+@app.cell
+def _(Image, explanation, mark_boundaries):
+    temp, mask = explanation.get_image_and_mask(explanation.top_labels[0], positive_only=True, num_features=5, hide_rest=False)
+    img_boundry1 = mark_boundaries(temp/255.0, mask)
+    #img_boundry1
+    Image.fromarray((img_boundry1*255).astype('uint8'), 'RGB')
     return
 
 
