@@ -112,90 +112,123 @@ def _():
     import torch
     from torchvision import models, transforms
     import torch.nn.functional as F
-    return F, Image, mo, models, torch, transforms
-
-
-@app.cell
-def _(Image):
     import glob
     import random
-    import os
-
-    random.seed(1337)
-
-    image_paths = random.sample(glob.glob('images/*.JPEG'), 10)
-
-    def get_image(path):
-        with open(os.path.abspath(path), 'rb') as f:
-            with Image.open(f) as img:
-                return img.convert('RGB')
-
-    images = [get_image(path) for path in image_paths]
-    images
-    return images, os
+    import os, json
+    return F, Image, glob, json, mo, models, os, torch, transforms
 
 
 @app.cell
-def _(images, transforms):
+def _(Image, os, transforms):
+    def get_image(path):
+        with open(os.path.abspath(path), "rb") as f:
+            with Image.open(f) as img:
+                return img.convert("RGB")
+
     def resize_image(img):
-        transf = transforms.Compose([
-            transforms.Resize((256, 256)),
-            transforms.CenterCrop(224),
-        ])    
+        transf = transforms.Compose(
+            [
+                transforms.Resize((256, 256)),
+                transforms.CenterCrop(224),
+            ]
+        )
 
         return transf(img)
+
 
     def process_image(img):
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                        std=[0.229, 0.224, 0.225])       
-        transf = transforms.Compose([
-            transforms.ToTensor(),
-            normalize
-        ])    
+        normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        )
+        transf = transforms.Compose([transforms.ToTensor(), normalize])
 
         return transf(img)
 
 
-    transform_image = lambda img: process_image(resize_image(img))
-
-    trans_images = [transform_image(img).unsqueeze(0) for img in images]
-    trans_images
-    return process_image, resize_image, trans_images
+    def transform_image(img):
+        return process_image(resize_image(img))
+    return get_image, process_image, resize_image, transform_image
 
 
 @app.cell
-def _(os):
-    import json
-
-    idx2label, cls2label, cls2idx = [], {}, {}
-    with open(os.path.abspath('./imagenet_class_index.json'), 'r') as read_file:
-        class_idx = json.load(read_file)
-        idx2label = [class_idx[str(k)][1] for k in range(len(class_idx))]
-        cls2label = {class_idx[str(k)][0]: class_idx[str(k)][1] for k in range(len(class_idx))}
-        cls2idx = {class_idx[str(k)][0]: k for k in range(len(class_idx))}    
-
-    cls2label
-    return (idx2label,)
+def _(models, torch):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = models.resnet18(weights="DEFAULT")
+    return device, model
 
 
-@app.cell(column=2)
+@app.cell
+def _(F, get_image, glob, model, transform_image):
+    model.to('cpu')
+    model.eval()
+    probs_paths = [(F.softmax(model(transform_image(get_image(path)).unsqueeze(0)), dim=1), path) for path in glob.glob('./images/*.JPEG')]
+    return (probs_paths,)
+
+
+@app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ## Model and predictions
+    ## In order to find some useful samples, let's choose the ones where the model was hesitating the most between the 2 top labels.
     """)
     return
 
 
 @app.cell
-def _(models):
-    model = models.resnet18(pretrained=True)
-    return (model,)
+def _(probs_paths):
+    def get_margin(probs):
+        top = probs.topk(2)
+        diff = top[0][0][0] - top[0][0][1]
+        return diff if top[0][0][0] > 0.4 else 1
+
+    margins = [get_margin(probs) for probs, _ in probs_paths]
+
+    paths = [path[1] for m, path in zip(margins, probs_paths) if m < 0.08]
+    paths
+    return (paths,)
 
 
 @app.cell
-def _(model, trans_images):
+def _(get_image, paths):
+    images = [get_image(path) for path in paths[:15]]
+    images
+    return (images,)
+
+
+@app.cell
+def _(images, transform_image):
+    trans_images = [transform_image(img).unsqueeze(0) for img in images]
+    return (trans_images,)
+
+
+@app.cell
+def _(json, os):
+    idx2label, cls2label, cls2idx = [], {}, {}
+    with open(os.path.abspath("./imagenet_class_index.json"), "r") as read_file:
+        class_idx = json.load(read_file)
+        idx2label = [class_idx[str(k)][1] for k in range(len(class_idx))]
+        cls2label = {
+            class_idx[str(k)][0]: class_idx[str(k)][1]
+            for k in range(len(class_idx))
+        }
+        cls2idx = {class_idx[str(k)][0]: k for k in range(len(class_idx))}
+
+    cls2label
+    return (idx2label,)
+
+
+@app.cell(column=2, hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Let's check what are the top predicted labels for the chosen samples
+    """)
+    return
+
+
+@app.cell
+def _(device, model, trans_images):
+    model.to(device)
     model.eval()
-    logits = [model(img_t) for img_t in trans_images]
+    logits = [model(img_t.to(device)) for img_t in trans_images]
     logits
     return (logits,)
 
@@ -209,7 +242,16 @@ def _(F, logits):
 
 @app.cell
 def _(idx2label, probs):
-    prob_label = [[(p, idx2label[idx]) for p, idx in zip(classes[0][0].detach().numpy(), classes[1][0].detach().numpy())] for classes in probs]
+    prob_label = [
+        [
+            (p, idx2label[idx])
+            for p, idx in zip(
+                classes[0][0].detach().cpu().numpy(),
+                classes[1][0].detach().cpu().numpy(),
+            )
+        ]
+        for classes in probs
+    ]
     prob_label
     return (prob_label,)
 
@@ -217,18 +259,43 @@ def _(idx2label, probs):
 @app.cell
 def _(images, mo, prob_label):
     mo.vstack(
-        [mo.hstack([img, mo.ui.table(data=[{'proba': f"{elem[0]:.4f}", 'label': elem[1]} for elem in classes])], widths=[2, 1]) for img, classes in zip(images, prob_label)]
+        [
+            mo.hstack(
+                [
+                    mo.center(img),
+                    mo.ui.table(
+                        data=[
+                            {"proba": f"{elem[0]:.4f}", "label": elem[1]}
+                            for elem in classes
+                        ],
+                        selection=None,
+                    ),
+                ],
+                widths=[2, 1],
+                justify="center",
+                align="center",
+            )
+            for img, classes in zip(images, prob_label)
+        ]
     )
     return
 
 
 @app.cell(column=3)
-def _(F, model, process_image, torch):
+def _():
+    from lime import lime_image
+    import numpy as np
+    from skimage.segmentation import mark_boundaries
+    import matplotlib.pyplot as plt
+    return lime_image, mark_boundaries, np
+
+
+@app.cell
+def _(F, device, model, process_image, torch):
     def batch_predict(images):
         model.eval()
         batch = torch.stack(tuple([process_image(img) for img in images]), dim=0)
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model.to(device)
         batch = batch.to(device)
 
@@ -239,36 +306,80 @@ def _(F, model, process_image, torch):
 
 
 @app.cell
+def _(
+    Image,
+    batch_predict,
+    idx2label,
+    lime_image,
+    mark_boundaries,
+    np,
+    resize_image,
+):
+    def explain_image(
+        img, pos_only=False, num_features=10, hide_rest=True, top_labels=5
+    ):
+        explainer = lime_image.LimeImageExplainer()
+        explanation = explainer.explain_instance(
+            np.array(resize_image(img)),
+            batch_predict,
+            top_labels=top_labels,
+            hide_color=0,
+            num_samples=1000,
+        )
+        boundaries = []
+        for label in explanation.top_labels:
+            temp, mask = explanation.get_image_and_mask(
+                label,
+                positive_only=pos_only,
+                num_features=num_features,
+                hide_rest=hide_rest,
+            )
+            img_boundry = mark_boundaries(temp / 255.0, mask)
+            boundaries.append(
+                (
+                    Image.fromarray((img_boundry * 255).astype("uint8"), "RGB"),
+                    idx2label[label],
+                )
+            )
+        return boundaries
+    return (explain_image,)
+
+
+@app.cell
+def _(explain_image, images):
+    exps = [
+        [(img, "")]
+        + explain_image(img, num_features=5, pos_only=True, top_labels=3)
+        for img in images
+    ]
+    return (exps,)
+
+
+@app.cell
+def _(exps, mo):
+    mo.vstack(
+        [
+            mo.hstack(
+                [mo.image(img, caption=cap) for img, cap in exp],
+                justify="center",
+                align="center",
+            )
+            for exp in exps
+        ]
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## In examples such as the firetruck and mushroom pictures, we can see clearly which parts of the image caused the model to swing toward one label or another. In other examples the differences are more subtle but we notice that in sax, for example, it is the particular parts of the instrument that can cause the model to identify it as a basson or sax.
+    """)
+    return
+
+
+@app.cell(column=4)
 def _():
-    from lime import lime_image
-    import numpy as np
-    return lime_image, np
-
-
-@app.cell
-def _(batch_predict, images, lime_image, np, resize_image):
-    explainer = lime_image.LimeImageExplainer()
-    explanation = explainer.explain_instance(np.array(resize_image(images[0])), 
-                                             batch_predict,
-                                             top_labels=5, 
-                                             hide_color=0, 
-                                             num_samples=1000)
-    return (explanation,)
-
-
-@app.cell
-def _():
-    from skimage.segmentation import mark_boundaries
-    import matplotlib.pyplot as plt
-    return (mark_boundaries,)
-
-
-@app.cell
-def _(Image, explanation, mark_boundaries):
-    temp, mask = explanation.get_image_and_mask(explanation.top_labels[0], positive_only=True, num_features=5, hide_rest=False)
-    img_boundry1 = mark_boundaries(temp/255.0, mask)
-    #img_boundry1
-    Image.fromarray((img_boundry1*255).astype('uint8'), 'RGB')
     return
 
 
