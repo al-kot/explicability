@@ -1,12 +1,14 @@
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.12"
 # dependencies = [
 #     "lime==0.2.0.1",
 #     "marimo>=0.19.7",
 #     "matplotlib==3.10.8",
-#     "numpy==2.2.6",
+#     "numpy==2.3.5",
+#     "opencv-python==4.13.0.90",
 #     "pillow==12.1.0",
 #     "scikit-image==0.25.2",
+#     "shap==0.50.0",
 #     "torch==2.10.0",
 #     "torchvision==0.25.0",
 # ]
@@ -115,6 +117,7 @@ def _():
     import glob
     import random
     import os, json
+    import gc
     return F, Image, glob, json, mo, models, os, torch, transforms
 
 
@@ -158,10 +161,11 @@ def _(models, torch):
 
 
 @app.cell
-def _(F, get_image, glob, model, transform_image):
+def _(F, get_image, glob, model, torch, transform_image):
     model.to('cpu')
     model.eval()
-    probs_paths = [(F.softmax(model(transform_image(get_image(path)).unsqueeze(0)), dim=1), path) for path in glob.glob('./images/*.JPEG')]
+    with torch.no_grad():
+        probs_paths = [(F.softmax(model(transform_image(get_image(path)).unsqueeze(0)), dim=1), path) for path in glob.glob('./images/*.JPEG')]
     return (probs_paths,)
 
 
@@ -211,8 +215,6 @@ def _(json, os):
             for k in range(len(class_idx))
         }
         cls2idx = {class_idx[str(k)][0]: k for k in range(len(class_idx))}
-
-    cls2label
     return (idx2label,)
 
 
@@ -229,14 +231,12 @@ def _(device, model, trans_images):
     model.to(device)
     model.eval()
     logits = [model(img_t.to(device)) for img_t in trans_images]
-    logits
     return (logits,)
 
 
 @app.cell
 def _(F, logits):
     probs = [F.softmax(logit, dim=1).topk(5) for logit in logits]
-    probs
     return (probs,)
 
 
@@ -252,7 +252,6 @@ def _(idx2label, probs):
         ]
         for classes in probs
     ]
-    prob_label
     return (prob_label,)
 
 
@@ -281,7 +280,15 @@ def _(images, mo, prob_label):
     return
 
 
-@app.cell(column=3)
+@app.cell(column=3, hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## LIME (Local Interpretable Model-agnostic Explanations) focuses on fast local interpretability. It perturbs the image (by masking superpixels) and learns a simple linear model to approximate the neural network's behavior around that specific image. It is intuitive ("if I hide this, does the prediction change?") and often faster to compute, but explanations can vary slightly between runs (instability) and are only valid locally.
+    """)
+    return
+
+
+@app.cell
 def _():
     from lime import lime_image
     import numpy as np
@@ -299,7 +306,8 @@ def _(F, device, model, process_image, torch):
         model.to(device)
         batch = batch.to(device)
 
-        logits = model(batch)
+        with torch.no_grad():
+            logits = model(batch)
         probs = F.softmax(logits, dim=1)
         return probs.detach().cpu().numpy()
     return (batch_predict,)
@@ -378,8 +386,71 @@ def _(mo):
     return
 
 
-@app.cell(column=4)
+@app.cell(column=4, hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## SHAP (SHapley Additive exPlanations) is based on game theory to ensure a fair and consistent attribution of importance to each feature. It offers superior theoretical consistency (if a feature contributes more, its SHAP score will not decrease) and allows for global analyses (feature importance across the entire dataset). However, the exact calculation is expensive thats why we will keep only few samples.
+    """)
+    return
+
+
+@app.cell
 def _():
+    import shap
+    return (shap,)
+
+
+@app.cell
+def _(images, np, resize_image):
+    kept_images = [images[3], images[12], images[13]]
+    images_np = np.array([resize_image(img) for img in kept_images])
+    return (images_np,)
+
+
+@app.cell
+def _(F, Image, device, model, np, process_image, torch):
+    def predict_for_shap(images_numpy):
+        model.eval()
+        processed_tensors = []
+        for img_np in images_numpy:
+            img_pil = Image.fromarray(img_np.astype(np.uint8))
+            processed_tensors.append(process_image(img_pil))
+
+        batch = torch.stack(processed_tensors, dim=0)
+        model.to(device)
+        batch = batch.to(device)
+        with torch.no_grad():
+            logits = model(batch)
+        probs = F.softmax(logits, dim=1)
+        return probs.detach().cpu().numpy()
+    return (predict_for_shap,)
+
+
+@app.cell
+def _(idx2label, images_np, predict_for_shap, shap):
+    shap_explainer = shap.Explainer(predict_for_shap, masker=shap.maskers.Image("blur(128,128)", images_np[0].shape), output_names=idx2label)
+    return (shap_explainer,)
+
+
+@app.cell
+def _(images_np, shap, shap_explainer):
+    shap_values = shap_explainer(images_np, max_evals=5000, outputs=shap.Explanation.argsort.flip[:3])
+    return (shap_values,)
+
+
+@app.cell
+def _(shap, shap_values):
+    shap_numpy = [shap_values.values[..., i] for i in range(shap_values.values.shape[-1])]
+    pixel_numpy = shap_values.data.astype(float) / 255.0
+    shap.image_plot(shap_numpy, pixel_numpy, labels=shap_values.output_names)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## The SHAP plots provide a granular pixel-level attribution, distinguishing positive (red) and negative (blue) contributions. Unlike LIME's superpixels, SHAP reveals that the model focuses on very specific textures or edges such as the minivan wheels and headlights or distinct patterns on an object like in case of the sax.
+    """)
     return
 
 
